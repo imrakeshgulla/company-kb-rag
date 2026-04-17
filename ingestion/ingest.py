@@ -15,10 +15,14 @@ def load_documents(folder_path):
         if file.endswith(".pdf"):
             print(f"📄 Reading: {file}")
             reader = PdfReader(os.path.join(folder_path, file))
-            for page in reader.pages:
+            for page_num, page in enumerate(reader.pages, 1):
                 text = page.extract_text()
                 if text:
-                    docs.append(text)
+                    docs.append({
+                        "text": text,
+                        "source": file,
+                        "page_number": page_num
+                    })
     print(f"✅ Loaded {len(docs)} pages total")
     return docs
 
@@ -28,20 +32,29 @@ def chunk_documents(docs):
         chunk_size=500,
         chunk_overlap=50
     )
-    chunks = splitter.create_documents(docs)
+    chunks = []
+    for doc in docs:
+        split_texts = splitter.split_text(doc["text"])
+        for i, chunk_text in enumerate(split_texts):
+            chunks.append({
+                "text":        chunk_text,
+                "source":      doc["source"],
+                "page_number": doc["page_number"],
+                "chunk_index": i
+            })
     print(f"✅ Created {len(chunks)} chunks")
     return chunks
 
 # STEP 3 - Convert chunks into numbers (embeddings)
 def embed_chunks(chunks):
     model = SentenceTransformer("all-MiniLM-L6-v2")
-    texts = [chunk.page_content for chunk in chunks]
+    texts = [chunk["text"] for chunk in chunks]
     embeddings = model.encode(texts, show_progress_bar=True)
     print(f"✅ Generated {len(embeddings)} embeddings")
-    return texts, embeddings
+    return chunks, embeddings
 
 # STEP 4 - Store everything in the database
-def store_in_db(texts, embeddings):
+def store_in_db(chunks, embeddings):
     conn = psycopg2.connect(
         host=os.getenv("DB_HOST"),
         dbname=os.getenv("DB_NAME"),
@@ -51,28 +64,41 @@ def store_in_db(texts, embeddings):
     register_vector(conn)
     cur = conn.cursor()
 
+    # Drop old table and create new one with metadata
+    cur.execute("DROP TABLE IF EXISTS documents;")
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS documents (
-            id SERIAL PRIMARY KEY,
-            content TEXT,
-            embedding vector(384)
+        CREATE TABLE documents (
+            id          SERIAL PRIMARY KEY,
+            source      TEXT,
+            page_number INTEGER,
+            chunk_index INTEGER,
+            content     TEXT,
+            embedding   vector(384)
         );
     """)
 
-    for text, embedding in zip(texts, embeddings):
+    for chunk, embedding in zip(chunks, embeddings):
         cur.execute(
-            "INSERT INTO documents (content, embedding) VALUES (%s, %s)",
-            (text, embedding.tolist())
+            """INSERT INTO documents 
+               (source, page_number, chunk_index, content, embedding) 
+               VALUES (%s, %s, %s, %s, %s)""",
+            (
+                chunk["source"],
+                chunk["page_number"],
+                chunk["chunk_index"],
+                chunk["text"],
+                embedding.tolist()
+            )
         )
 
     conn.commit()
     cur.close()
     conn.close()
-    print("✅ All chunks stored in database!")
+    print("✅ All chunks stored in database with metadata!")
 
 # RUN EVERYTHING
 if __name__ == "__main__":
     docs = load_documents("data/")
     chunks = chunk_documents(docs)
-    texts, embeddings = embed_chunks(chunks)
-    store_in_db(texts, embeddings)
+    chunks, embeddings = embed_chunks(chunks)
+    store_in_db(chunks, embeddings)
